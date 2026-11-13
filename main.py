@@ -1,4 +1,14 @@
-from fastapi import FastAPI
+# cd chronicle-backend
+# .\venv\Scripts\Activate.ps1
+# uvicorn main:app --reload
+# docker start chronicle-db 
+#  docker ps
+# docker exec -it chronicle-db psql -U postgres
+# \c chronicle
+# docker start chronicle-db
+
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 import json
@@ -6,14 +16,23 @@ from dotenv import load_dotenv
 import os
 from openai import OpenAI
 from datetime import date, timedelta
-
+from fastapi.middleware.cors import CORSMiddleware
+import re
 
 load_dotenv()
+MODEL = os.getenv("MODEL_NAME", "anthropic/claude-haiku-4.5")
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1"
 )
+
 engine = create_engine("postgresql://postgres:chronicle123@localhost:5432/chronicle")
 
 PLACE_TO_REGION = {
@@ -32,27 +51,36 @@ class PlaythroughRequest(BaseModel):
 @app.post("/playthroughs")
 def create_playthrough(data: PlaythroughRequest):
     response = client.chat.completions.create(
-        model="anthropic/claude-sonnet-4.5",
-        max_tokens=500,
+        model=MODEL,
+        max_tokens=200,
         messages=[
             {
                 "role": "user",
-                "content": f"Create a fictional character living in {data.place} in the year {data.year}, working as a {data.role}. Respond with ONLY a JSON object with these exact fields: name, age, occupation, family (list), location, wealth_level, health, personality_traits (list), relationships (list of objects with name/role/sentiment), life_flags (object with married/has_children/displaced booleans), recent_events_seen (empty list). No extra text, just the JSON."
+                "content": f"Create a fictional character living in {data.place} in the year {data.year}, working as a {data.role}. Respond with ONLY a compact one-line JSON object with exactly these fields: name, age (number), occupation, location, personality_traits (list of 3 single words). No extra text, just the JSON."
             }
         ]
     )
-    raw_content = response.choices[0].message.content
-    raw_content = raw_content.strip()
-    if raw_content.startswith("```"):
-        raw_content = raw_content.split("```")[1]
-        if raw_content.startswith("json"):
-            raw_content = raw_content[4:]
-    character_state = json.loads(raw_content.strip())
+
+    if response.choices[0].finish_reason == "length":
+        raise HTTPException(status_code=502, detail="Character generation was cut off. Try again.")
+
+    raw_content = response.choices[0].message.content.strip()
+    print("RAW MODEL OUTPUT:", raw_content)
+
+    start = raw_content.find("{")
+    end = raw_content.rfind("}")
+    if start == -1 or end == -1:
+        raise HTTPException(status_code=502, detail="Model returned no JSON. Try again.")
+
+    try:
+        character_state = json.loads(raw_content[start:end + 1])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Model returned invalid JSON. Try again.")
 
     region = PLACE_TO_REGION.get(data.place.lower())
     if region is None:
         region_response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4.5",
+            model=MODEL,
             max_tokens=20,
             messages=[
                 {
@@ -82,13 +110,15 @@ def create_playthrough(data: PlaythroughRequest):
         )
         connection.commit()
         new_id = result.fetchone()[0]
-        return {"playthrough_id": new_id, "character_state": character_state}
+        return {"playthrough_id": new_id, "region": region, "character_state": character_state}
+
 
 @app.get("/test-db")
 def test_db():
     connection = engine.connect()
     connection.close()
     return {"status": "connected"}
+
 
 @app.get("/playthroughs/{playthrough_id}")
 def get_playthrough(playthrough_id: str):
@@ -105,8 +135,10 @@ def get_playthrough(playthrough_id: str):
             "character_state": row.character_state
         }
 
+
 class AdvanceRequest(BaseModel):
     skip: str
+
 
 @app.get("/events")
 def get_events():
@@ -127,6 +159,7 @@ def get_events():
             })
         return events
 
+
 @app.post("/playthroughs/{playthrough_id}/advance")
 def advance_playthrough(playthrough_id: str, data: AdvanceRequest):
     with engine.connect() as connection:
@@ -138,12 +171,18 @@ def advance_playthrough(playthrough_id: str, data: AdvanceRequest):
 
         current_date = row.current_game_date
 
-        if data.skip == "1d":
-            new_date = current_date + timedelta(days=1)
-        elif data.skip == "1w":
-            new_date = current_date + timedelta(weeks=1)
-        elif data.skip == "1m":
-            new_date = current_date + timedelta(days=30)
+        match = re.fullmatch(r"(\d+)([dwmy])", data.skip)
+        if match:
+            n = int(match.group(1))
+            unit = match.group(2)
+            if unit == "d":
+                new_date = current_date + timedelta(days=n)
+            elif unit == "w":
+                new_date = current_date + timedelta(weeks=n)
+            elif unit == "m":
+                new_date = current_date + timedelta(days=30 * n)
+            else:
+                new_date = current_date + timedelta(days=365 * n)
         else:
             new_date = current_date
 
@@ -168,8 +207,8 @@ def advance_playthrough(playthrough_id: str, data: AdvanceRequest):
             character_name = json.loads(row.character_state)["name"] if isinstance(row.character_state, str) else row.character_state["name"]
 
             narrative_response = client.chat.completions.create(
-                model="anthropic/claude-sonnet-4.5",
-                max_tokens=300,
+                model=MODEL,
+                max_tokens=150,
                 messages=[
                     {
                         "role": "user",
@@ -209,3 +248,7 @@ def advance_playthrough(playthrough_id: str, data: AdvanceRequest):
             "new_date": str(new_date),
             "events": event_ids
         }
+
+# curl -X 'GET' \
+#   'http://127.0.0.1:8000/add?n=5&i=5' \
+#   -H 'accept: */*'
